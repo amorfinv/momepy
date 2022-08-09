@@ -47,30 +47,72 @@ def _angle(a, b, c):
     return abs((a2 - a1 + 180) % 360 - 180)
 
 
-def _generate_primal(G, gdf_network, fields, multigraph, oneway_column=None):
+def _generate_primal(
+    G, gdf_network, fields, multigraph, oneway_column=None, osmnx_like=False
+):
     """
     Generate primal graph.
     Helper for gdf_to_nx.
     """
     G.graph["approach"] = "primal"
-    key = 0
-    for row in gdf_network.itertuples():
-        first = row.geometry.coords[0]
-        last = row.geometry.coords[-1]
 
-        data = [r for r in row][1:]
-        attributes = dict(zip(fields, data))
-        if multigraph:
-            G.add_edge(first, last, key=key, **attributes)
-            key += 1
+    if not osmnx_like:
+        key = 0
+        for row in gdf_network.itertuples():
+            first = row.geometry.coords[0]
+            last = row.geometry.coords[-1]
 
-            if oneway_column:
-                oneway = bool(getattr(row, oneway_column))
-                if not oneway:
-                    G.add_edge(last, first, key=key, **attributes)
-                    key += 1
-        else:
-            G.add_edge(first, last, **attributes)
+            data = [r for r in row][1:]
+            attributes = dict(zip(fields, data))
+            if multigraph:
+                G.add_edge(first, last, key=key, **attributes)
+                key += 1
+
+                if oneway_column:
+                    oneway = bool(getattr(row, oneway_column))
+                    if not oneway:
+                        G.add_edge(last, first, key=key, **attributes)
+                        key += 1
+            else:
+                G.add_edge(first, last, **attributes)
+
+    else:
+        # create a df of node geometry
+        nodes = (
+            gdf_network.geometry.apply(lambda x: [x.coords[0], x.coords[-1]])
+            .explode()
+            .reset_index(drop=True)
+        )
+
+        # check for duplicate geometries and remove the duplicates
+        nodes = nodes[~nodes.duplicated()].reset_index(drop=True)
+
+        # add the nodes to the graph
+        G.add_nodes_from(nodes.index)
+
+        # assign x,y as attributes to the nodes
+        nx.set_node_attributes(G, name="x", values=nodes.apply(lambda x: x[0]))
+        nx.set_node_attributes(G, name="y", values=nodes.apply(lambda x: x[1]))
+
+        for row in gdf_network.itertuples():
+            first = row.geometry.coords[0]
+            last = row.geometry.coords[-1]
+
+            # in nodes df find the index of the first and last point of the line
+            u = nodes.index[nodes == first].tolist()[0]
+            v = nodes.index[nodes == last].tolist()[0]
+
+            key = 0
+            # check if u,v already exists
+            if G.has_edge(u, v):
+                # if it does exist the length of the edge is the key for the new edge
+                key = len(G[u][v])
+
+            data = [r for r in row][1:]
+            attributes = dict(zip(fields, data))
+
+            # add the edge to the graph
+            G.add_edge(u, v, key=key, **attributes)
 
 
 def _generate_dual(G, gdf_network, fields, angles, multigraph, angle):
@@ -133,6 +175,7 @@ def gdf_to_nx(
     angles=True,
     angle="angle",
     oneway_column=None,
+    osmnx_like=False,
 ):
     """
     Convert LineString GeoDataFrame to networkx.MultiGraph or other Graph as per
@@ -153,7 +196,8 @@ def gdf_to_nx(
         LineStrings as nodes and their topological relation as edges. In such a
         case, it can encode an angle between LineStrings as an edge attribute.
     length : str, default 'mm_len'
-        name of attribute of segment length (geographical) which will be saved to graph
+        name of attribute of segment length (geographical) which will be saved to graph.
+        Modified to 'length' if ``osmnx_like`` is True.s
     multigraph : bool, default True
         create ``MultiGraph`` of ``Graph`` (potentially directed). ``MutliGraph``
         allows multiple
@@ -172,6 +216,8 @@ def gdf_to_nx(
         specifying the boolean column in the GeoDataFrame. Note, that the reverse conversion
         ``nx_to_gdf(gdf_to_nx(gdf, directed=True, oneway_column="oneway"))`` will contain
         additional duplicated geometries.
+    osmnx_like : bool, default False
+        create a graph with the same structure as OSMnx graph.
 
     Returns
     -------
@@ -227,7 +273,10 @@ def gdf_to_nx(
     if "key" in gdf_network.columns:
         gdf_network.rename(columns={"key": "__key"}, inplace=True)
 
-    if multigraph and directed:
+    if osmnx_like:
+        net = nx.MultiDiGraph()
+        approach = "primal"
+    elif multigraph and directed:
         net = nx.MultiDiGraph()
     elif multigraph and not directed:
         net = nx.MultiGraph()
@@ -245,8 +294,9 @@ def gdf_to_nx(
             raise ValueError(
                 "Bidirectional lines are only supported for directed graphs."
             )
-
-        _generate_primal(net, gdf_network, fields, multigraph, oneway_column)
+        _generate_primal(
+            net, gdf_network, fields, multigraph, oneway_column, osmnx_like
+        )
 
     elif approach == "dual":
         if directed:
